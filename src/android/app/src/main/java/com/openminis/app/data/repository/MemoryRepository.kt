@@ -21,7 +21,7 @@ class MemoryRepository(private val memoryDir: File) {
     companion object {
         private const val TAG = "MemoryRepository"
         private const val GLOBAL_FILE = "GLOBAL.md"
-        private const val MAX_INJECT_LINES = 200
+        private const val MAX_INJECT_LINES = 80
         // memory_get full-dump (no keywords): cap at 500 lines — matches iOS
         // `maxTotalLines = 500` in AIChatViewModel+MemoryTools.swift.
         private const val MAX_DUMP_LINES = 500
@@ -31,7 +31,13 @@ class MemoryRepository(private val memoryDir: File) {
         // and align on the 60 magnitude as the line budget.
         private const val MAX_SEARCH_LINES = 60
         private const val MAX_LOOKBACK_DAYS = 30
-        private const val MAX_RECENT_FILES = 3
+        // [T-daily-inject-budget] 3 files x 200 lines was the iOS-parity value and
+        // it dominated the system prompt: measured 2026-11-15, the injected block
+        // was 27.7k chars (~18k tokens) of daily log, while GLOBAL.md — the part
+        // the model is actually supposed to obey — is 3.2k. The rules ended up
+        // buried behind a wall of log text. 2 x 80 keeps a day's context without
+        // drowning the rules. Deliberate divergence from iOS (same reason).
+        private const val MAX_RECENT_FILES = 2
 
         /**
          * [XSessionDiag] Vocabulary that suggests an injected daily log describes

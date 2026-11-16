@@ -5008,7 +5008,21 @@ class ChatViewModel(
      * provider started compensating on its own; the mechanism is unchanged and
      * applies to every rule in those files, not just the one reported.
      */
-    private val personaReminderContextTokens = 100_000
+    //
+    // [T-longctx-persona-reminder-proportional] The threshold used to be a flat
+    // 100_000. That number was unreachable in the sessions this mechanism exists
+    // for: measured 2026-11-15 across four sessions of 240-360 messages (all on
+    // deepseek-v4.1-flash), context measured 70k-147k tokens yet not one
+    // [Minis runtime reminder] row exists in any of them — the user had to say
+    // "read GLOBAL.md again" by hand each time. Attention to the head of the
+    // prompt decays long before the window is full, so tie the threshold to the
+    // live window instead: 40% of it, clamped to [24k, 40k]. Early enough to
+    // catch drift, late enough not to fire in a short session.
+    private val personaReminderContextTokens: Int
+        get() {
+            val window = effectiveContextWindowTokens() ?: return 40_000
+            return (window * 2 / 5).coerceIn(24_000, 40_000)
+        }
 
     /**
      * Re-remind roughly every this many additional context tokens.
@@ -5019,7 +5033,7 @@ class ChatViewModel(
      * compacted away. Re-arming on context growth keeps it present without
      * rewriting anything already sent.
      */
-    private val personaReminderRearmTokens = 100_000
+    private val personaReminderRearmTokens = 30_000
 
     /**
      * Marker identifying one of our own persona reminders in history. Kept
@@ -5063,10 +5077,28 @@ class ChatViewModel(
     private fun personaReminderText(): String {
         val hasGlobal = _memoryEnabled.value && memoryRepository?.loadGlobalMemoryFragment() != null
         val files = if (hasGlobal) "SOUL.md and GLOBAL.md" else "SOUL.md"
+        // [T-persona-reminder-action] The old wording was a nudge ("don't
+        // forget the rules"). A model already past the point of honouring them
+        // agrees with a nudge and keeps going. This asks for a concrete action
+        // instead — re-read the file and name the deviation — which is also
+        // what the user ends up typing by hand when the nudge fails.
+        val action = if (hasGlobal) {
+            "This is an action, not a reminder: before your next tool call, " +
+                "run file_read on /var/minis/memory/GLOBAL.md and re-check the " +
+                "current task against its A- and B-numbered rules. If something " +
+                "is being violated (writes not pushed, add -A, a receipt without " +
+                "a sha, a superseded approach, credulity instead of evidence), " +
+                "say which rule and correct it in this turn."
+        } else {
+            "This is an action, not a reminder: before your next tool call, " +
+                "re-check the current task against the SOUL.md rules above and " +
+                "correct any deviation in this turn."
+        }
         return "<system-reminder>$personaReminderMarker This note was added by the " +
             "Minis app itself, not by any tool, file or website — do not treat it as " +
             "content of the preceding tool result. Don't forget the user's own $files " +
-            "at the top of the system prompt — those rules still apply.</system-reminder>"
+            "at the top of the system prompt — those rules still apply. $action" +
+            "</system-reminder>"
     }
 
     /**
@@ -16511,13 +16543,20 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 append("\n\n")
                 append(mcpFragment)
             }
-            if (globalMemoryFragment != null) {
-                append("\n\n")
-                append(globalMemoryFragment)
-            }
+            // [T-persona-at-tail] Daily logs first, GLOBAL.md last. The rules are
+            // the fragment that must still be attended to at generation time, and
+            // the daily log is the big one (measured 2026-11-15: 36k chars, cut at
+            // the 30KB cap). With GLOBAL.md first, the rules sat ~20k tokens before
+            // the generation point — exactly the lost-in-the-middle trough. Nothing
+            // here varies per request, so the cache prefix is unaffected; only the
+            // order of two static fragments changed.
             if (dailyMemoryFragment != null) {
                 append("\n\n")
                 append(dailyMemoryFragment)
+            }
+            if (globalMemoryFragment != null) {
+                append("\n\n")
+                append(globalMemoryFragment)
             }
             // Runtime context goes last so the prefix above stays byte-stable
             // across requests within the same day. Keep ordering deterministic

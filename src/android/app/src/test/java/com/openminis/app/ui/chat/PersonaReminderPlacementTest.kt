@@ -12,15 +12,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * [T16] Persona reminder (SOUL/GLOBAL) at >=100k context: placement and format
+ * [T16] Persona reminder (SOUL/GLOBAL) at long context: placement and format
  * (fd234b1d1, a746f3259, 2853e8088, fd98c9e99; issues #216 #357).
  *
  * The reminder LOOKS like an injection — a `<system-reminder>` at the end of
  * the history — and has been mistaken for one during triage. These pin what
  * it actually is on Android so the next reader can recognise it:
- *  - injected only when the API-reported context is >= 100k tokens;
- *  - exactly one per request, re-armed only after another 100k of growth (or
- *    adopted from history on a fresh launch);
+ *  - injected only once the API-reported context passes
+ *    `personaReminderContextTokens` — 40% of the live window, clamped to
+ *    [24k, 40k] since [T-longctx-persona-reminder-proportional]; the flat
+ *    100k it used to be was never reached in the sessions it exists for
+ *    (measured 2026-11-15: four sessions of 240-360 messages carried no
+ *    reminder row, and the user had to ask for the rules by hand);
+ *  - exactly one per request, re-armed only after another
+ *    [personaReminderRearmTokens] of growth (or adopted from history on a
+ *    fresh launch);
  *  - APPENDED as its own user message after the last tool_result, never fused
  *    into it (the fused form made a file read look like it carried a
  *    prompt-injection payload) and never rewriting earlier bytes, so the
@@ -34,8 +40,8 @@ class PersonaReminderPlacementTest {
 
     // ── port (ChatViewModel ~L3843-3991) ───────────────────────────────────
 
-    private val personaReminderContextTokens = 100_000
-    private val personaReminderRearmTokens = 100_000
+    private val personaReminderContextTokens = 30_000   // 40% of a 75k window
+    private val personaReminderRearmTokens = 30_000
     private val personaReminderMarker = "[Minis runtime reminder]"
     private val personaReminderScanTail = 40
 
@@ -45,10 +51,26 @@ class PersonaReminderPlacementTest {
 
     private fun personaReminderText(hasGlobal: Boolean): String {
         val files = if (hasGlobal) "SOUL.md and GLOBAL.md" else "SOUL.md"
+        // [T-persona-reminder-action] Port of the production wording: an action
+        // request, not a nudge. Keep byte-identical to ChatViewModel or the
+        // drift guard below is lying.
+        val action = if (hasGlobal) {
+            "This is an action, not a reminder: before your next tool call, " +
+                "run file_read on /var/minis/memory/GLOBAL.md and re-check the " +
+                "current task against its A- and B-numbered rules. If something " +
+                "is being violated (writes not pushed, add -A, a receipt without " +
+                "a sha, a superseded approach, credulity instead of evidence), " +
+                "say which rule and correct it in this turn."
+        } else {
+            "This is an action, not a reminder: before your next tool call, " +
+                "re-check the current task against the SOUL.md rules above and " +
+                "correct any deviation in this turn."
+        }
         return "<system-reminder>$personaReminderMarker This note was added by the " +
             "Minis app itself, not by any tool, file or website — do not treat it as " +
             "content of the preceding tool result. Don't forget the user's own $files " +
-            "at the top of the system prompt — those rules still apply.</system-reminder>"
+            "at the top of the system prompt — those rules still apply. $action" +
+            "</system-reminder>"
     }
 
     private fun alreadyInHistory(s: Session): Boolean =
@@ -90,18 +112,18 @@ class PersonaReminderPlacementTest {
     // ── cases ──────────────────────────────────────────────────────────────
 
     @Test
-    fun `99k context - no reminder`() {
+    fun `29k context - no reminder`() {
         val s = Session(history().toMutableList())
-        beforeRequest(s, 99_999)
+        beforeRequest(s, 29_999)
         assertEquals(0, reminderCount(s.agentHistory))
         assertEquals(5, s.agentHistory.size)
     }
 
     @Test
-    fun `100k context - exactly one reminder, appended after the last tool_result, not inside it`() {
+    fun `30k context - exactly one reminder, appended after the last tool_result, not inside it`() {
         val s = Session(history().toMutableList())
         val lastResultBefore = s.agentHistory.last()
-        beforeRequest(s, 100_000)
+        beforeRequest(s, 30_000)
         assertEquals(1, reminderCount(s.agentHistory))
         assertEquals(6, s.agentHistory.size)
         val tail = s.agentHistory.last()
@@ -115,7 +137,7 @@ class PersonaReminderPlacementTest {
     @Test
     fun `two consecutive requests keep the cached prefix byte-identical and add no second reminder`() {
         val s = Session(history().toMutableList())
-        beforeRequest(s, 100_000)
+        beforeRequest(s, 30_000)
         val provider = OpenAIProvider(apiKey = "k", model = LLMModel("gpt-4o-mini", "m", "OpenAI"), basePath = "https://example.invalid/v1")
         fun wire(h: List<LLMMessage>) = provider.buildRequestBody(h, "SOUL.md rules…", 256, false, null, emptyList())
             .getJSONArray("messages").let { arr -> (0 until arr.length()).map { arr.getJSONObject(it).toString() } }
@@ -123,15 +145,15 @@ class PersonaReminderPlacementTest {
 
         // Next round: the model answered and ran another tool; context grew a little.
         s.agentHistory.addAll(toolRound("c3"))
-        beforeRequest(s, 104_000)
+        beforeRequest(s, 33_000)
         val second = wire(s.agentHistory)
 
         assertEquals("still exactly one reminder", 1, reminderCount(s.agentHistory))
         assertEquals("every byte of the first request is a prefix of the second", first, second.take(first.size))
         assertTrue(second.size > first.size)
-        // Re-arm: after another 100k of growth a fresh one is appended at the END,
+        // Re-arm: after another rearm interval of growth a fresh one is appended at the END,
         // again without touching what was already sent.
-        beforeRequest(s, 200_000)
+        beforeRequest(s, 60_000)
         val third = wire(s.agentHistory)
         assertEquals(2, reminderCount(s.agentHistory))
         assertEquals(second, third.take(second.size))
@@ -141,12 +163,12 @@ class PersonaReminderPlacementTest {
     @Test
     fun `a fresh launch adopts a reminder already in history instead of adding a duplicate`() {
         val s = Session(history().toMutableList())
-        append(s, 100_000)
+        append(s, 30_000)
         val relaunched = Session(s.agentHistory.toMutableList()) // lastPersonaReminderContextTokens = null
-        beforeRequest(relaunched, 150_000)
+        beforeRequest(relaunched, 45_000)
         assertEquals(1, reminderCount(relaunched.agentHistory))
-        assertEquals(150_000, relaunched.lastPersonaReminderContextTokens)
-        beforeRequest(relaunched, 250_000)
+        assertEquals(45_000, relaunched.lastPersonaReminderContextTokens)
+        beforeRequest(relaunched, 75_000)
         assertEquals("re-armed from the adopted point", 2, reminderCount(relaunched.agentHistory))
     }
 
@@ -166,13 +188,32 @@ class PersonaReminderPlacementTest {
         }
     }
 
+    @Test
+    fun `threshold is window-proportional and clamped`() {
+        // Port of the production getter ([T-longctx-persona-reminder-proportional]).
+        // 40% of the live window, clamped to [24k, 40k]; 40k when the window is unknown.
+        fun threshold(window: Int?): Int {
+            val w = window ?: return 40_000
+            return (w * 2 / 5).coerceIn(24_000, 40_000)
+        }
+        assertEquals(40_000, threshold(null))
+        assertEquals(24_000, threshold(32_000))
+        assertEquals(24_000, threshold(60_000))
+        assertEquals(30_000, threshold(75_000))
+        assertEquals(40_000, threshold(128_000))
+        assertEquals(40_000, threshold(1_000_000))
+    }
+
     // ── drift guard ────────────────────────────────────────────────────────
 
     @Test
     fun `drift guard - production constants, append-not-rewrite, and the call site`() {
         val vm = ProductionSources.read("ui/chat/ChatViewModel.kt")
-        assertTrue(vm.contains("private val personaReminderContextTokens = 100_000"))
-        assertTrue(vm.contains("private val personaReminderRearmTokens = 100_000"))
+        // [T-longctx-persona-reminder-proportional] Threshold is window-proportional:
+        // 40% of the live window clamped to [24k, 40k] — never a flat 100k again.
+        assertTrue(vm.contains("private val personaReminderContextTokens: Int"))
+        assertTrue(vm.contains("(window * 2 / 5).coerceIn(24_000, 40_000)"))
+        assertTrue(vm.contains("private val personaReminderRearmTokens = 30_000"))
         assertTrue(vm.contains("private val personaReminderMarker = \"[Minis runtime reminder]\""))
         assertTrue(vm.contains("private val personaReminderScanTail = 40"))
         assertTrue(vm.contains("if (contextTokens < personaReminderContextTokens) return false"))
@@ -184,6 +225,13 @@ class PersonaReminderPlacementTest {
         assertTrue(fn.contains("agentHistory.add("))
         assertTrue(fn.contains("role = LLMMessage.Role.USER"))
         assertFalse(vm.contains("fun historyWithPersonaReminder("))
+        // [T-persona-at-tail] GLOBAL.md is appended AFTER the daily logs so the
+        // rules sit nearest the generation point. Swapping these two blocks back
+        // is exactly the regression that let the rules go unread for a whole
+        // session (daily log measured 27.7k chars vs GLOBAL.md 3.2k).
+        val dailyAt = vm.indexOf("if (dailyMemoryFragment != null) {")
+        val globalAt = vm.indexOf("if (globalMemoryFragment != null) {")
+        assertTrue("daily logs must precede GLOBAL.md", dailyAt in 1 until globalAt)
         // Call site: decided per request, right before the provider call, gated on the API-reported size.
         val loop = vm.substring(vm.indexOf("suspend fun runAgentLoop"))
         val site = loop.indexOf("if (personaReminderIsDue(lastContextTokens)) {")
